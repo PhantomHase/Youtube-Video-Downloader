@@ -13,9 +13,7 @@ Usage:
 """
 
 import argparse
-import json
 import os
-import re
 import sys
 import threading
 import tkinter as tk
@@ -37,6 +35,13 @@ SUPPORTED_AUDIO_FORMATS = ["mp3", "m4a", "wav", "flac", "opus", "aac", "ogg"]
 RESOLUTIONS = ["2160", "1440", "1080", "720", "480", "360", "240", "144"]
 
 
+# ─── Custom Exceptions ──────────────────────────────────────────────────────
+
+class DownloadCancelled(Exception):
+    """Raised when user cancels a download."""
+    pass
+
+
 # ─── Core Download Engine ────────────────────────────────────────────────────
 
 class DownloadEngine:
@@ -55,7 +60,7 @@ class DownloadEngine:
 
     def _progress_hook(self, d):
         if self._cancelled:
-            raise yt_dlp.utils.DownloadCancelled("Download cancelled by user")
+            raise DownloadCancelled("Download cancelled by user")
 
         if d["status"] == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
@@ -175,6 +180,7 @@ class DownloaderApp:
 
         self.engine = None
         self.downloading = False
+        self._user_cancelled = False
         self.download_dir = DEFAULT_DOWNLOAD_DIR
 
         self._build_ui()
@@ -357,15 +363,15 @@ class DownloaderApp:
 
         def _worker():
             try:
-                self._log(f"Fetching info for: {url[:80]}...")
+                self.root.after(0, lambda: self._log(f"Fetching info for: {url[:80]}..."))
                 engine = DownloadEngine(output_dir=self.download_dir)
                 info = engine.fetch_info(url)
                 if info:
                     self.root.after(0, lambda: self._show_info(info))
                 else:
-                    self._log("Could not fetch video info.")
+                    self.root.after(0, lambda: self._log("Could not fetch video info."))
             except Exception as e:
-                self._log(f"Error: {e}")
+                self.root.after(0, lambda: self._log(f"Error: {e}"))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -418,6 +424,7 @@ class DownloaderApp:
             return
 
         self.downloading = True
+        self._user_cancelled = False
         self.download_btn.configure(state="disabled", bg="#636e72")
         self.cancel_btn.configure(state="normal")
         self.progress_bar["value"] = 0
@@ -442,7 +449,11 @@ class DownloaderApp:
             self.root.after(0, lambda: self._download_done(filename, title))
 
         def on_error(err):
-            self.root.after(0, lambda: self._download_error(err))
+            # Distinguish between cancel and real error
+            if self._user_cancelled:
+                self.root.after(0, self._download_cancelled)
+            else:
+                self.root.after(0, lambda: self._download_error(err))
 
         def _worker():
             try:
@@ -459,6 +470,8 @@ class DownloaderApp:
                     audio_only=audio_only,
                     audio_format=afmt,
                 )
+            except DownloadCancelled:
+                pass  # User cancelled — already handled
             except Exception:
                 pass  # Already handled via on_error
 
@@ -492,13 +505,24 @@ class DownloaderApp:
         self._log(f"❌ Error: {err}")
         messagebox.showerror("Download Error", f"Download failed:\n\n{err}")
 
+    def _download_cancelled(self):
+        """Clean reset after user cancels — no error dialog."""
+        self.downloading = False
+        self._user_cancelled = False
+        self.download_btn.configure(state="normal", bg="#e94560")
+        self.cancel_btn.configure(state="disabled")
+        self.progress_bar["value"] = 0
+        self.percent_label.config(text="0%")
+        self.speed_label.config(text="")
+        self.eta_label.config(text="")
+
     def _cancel_download(self):
         if self.engine:
+            self._user_cancelled = True
             self.engine.cancel()
             self._log("⛔ Download cancelled by user.")
-            self.downloading = False
-            self.download_btn.configure(state="normal", bg="#e94560")
-            self.cancel_btn.configure(state="disabled")
+            # Give the thread a moment to finish, then clean up
+            self.root.after(500, self._download_cancelled)
 
 
 # ─── CLI Mode ────────────────────────────────────────────────────────────────
