@@ -16,10 +16,18 @@ import argparse
 import os
 import sys
 import threading
-import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ImportError:
+    print("ERROR: tkinter is not installed.")
+    print("  Linux:   sudo apt install python3-tk")
+    print("  macOS:   brew install python-tk")
+    print("  Windows: reinstall Python with 'tcl/tk' checked")
+    sys.exit(1)
 
 try:
     import yt_dlp
@@ -102,7 +110,7 @@ class DownloadEngine:
         """Download a video or extract audio."""
         self._cancelled = False
 
-        outtmpl = os.path.join(self.output_dir, "%(title)s.%(ext)s")
+        outtmpl = os.path.join(self.output_dir, "%(title)s [%(id)s].%(ext)s")
 
         if audio_only:
             ydl_opts = {
@@ -122,6 +130,7 @@ class DownloadEngine:
                 "fragment_retries": 10,
                 "continuedl": True,  # Resume support
                 "concurrent_fragment_downloads": 4,
+                "windowsfilenames": True,  # Sanitize filenames for all platforms
             }
             if embed_thumbnail:
                 ydl_opts["postprocessors"].append({
@@ -149,6 +158,7 @@ class DownloadEngine:
                 "concurrent_fragment_downloads": 4,
                 "writesubtitles": False,
                 "writeautomaticsub": False,
+                "windowsfilenames": True,  # Sanitize filenames for all platforms
             }
 
         try:
@@ -181,6 +191,7 @@ class DownloaderApp:
         self.engine = None
         self.downloading = False
         self._user_cancelled = False
+        self._cancel_timer_id = None
         self.download_dir = DEFAULT_DOWNLOAD_DIR
 
         self._build_ui()
@@ -240,10 +251,10 @@ class DownloaderApp:
                                       values=["best"] + RESOLUTIONS, width=10)
         self.res_combo.grid(row=0, column=3, padx=(4, 20))
 
-        # Audio format
+        # Audio format (disabled by default — video mode)
         ttk.Label(opts_frame, text="Audio fmt:").grid(row=0, column=4, sticky="w")
         self.afmt_var = tk.StringVar(value="mp3")
-        self.afmt_combo = ttk.Combobox(opts_frame, textvariable=self.afmt_var, state="readonly",
+        self.afmt_combo = ttk.Combobox(opts_frame, textvariable=self.afmt_var, state="disabled",
                                        values=SUPPORTED_AUDIO_FORMATS, width=8)
         self.afmt_combo.grid(row=0, column=5, padx=(4, 0))
 
@@ -347,11 +358,23 @@ class DownloaderApp:
     def _format_eta(self, seconds):
         if not seconds:
             return ""
-        m, s = divmod(int(seconds), 60)
-        h, m = divmod(m, 60)
+        seconds = int(seconds)
+        h, remainder = divmod(seconds, 3600)
+        m, s = divmod(remainder, 60)
         if h:
-            return f"{h}h {m}m {s}s"
-        return f"{m}m {s}s"
+            return f"{h}h {m:02d}m {s:02d}s"
+        return f"{m}m {s:02d}s"
+
+    def _format_duration(self, seconds):
+        """Format duration as H:MM:SS or M:SS."""
+        if not seconds:
+            return "N/A"
+        seconds = int(seconds)
+        h, remainder = divmod(seconds, 3600)
+        m, s = divmod(remainder, 60)
+        if h:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m}:{s:02d}"
 
     # ── Fetch Info ───────────────────────────────────────────────────────
 
@@ -383,7 +406,7 @@ class DownloaderApp:
         site = info.get("extractor", "Unknown")
         formats = info.get("formats", [])
 
-        dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else "N/A"
+        dur_str = self._format_duration(duration)
         views_str = f"{views:,}" if views else "N/A"
 
         heights = sorted(set(
@@ -478,6 +501,7 @@ class DownloaderApp:
         threading.Thread(target=_worker, daemon=True).start()
 
     def _update_progress(self, pct, downloaded, total, speed, eta):
+        pct = max(0.0, min(100.0, pct))  # Clamp to valid range
         self.progress_bar["value"] = pct
         self.percent_label.config(text=f"{pct:.1f}%")
         if total:
@@ -506,9 +530,15 @@ class DownloaderApp:
         messagebox.showerror("Download Error", f"Download failed:\n\n{err}")
 
     def _download_cancelled(self):
-        """Clean reset after user cancels — no error dialog."""
+        """Clean reset after user cancels — no error dialog. Idempotent."""
+        if not self.downloading and not self._user_cancelled:
+            return  # Already handled — avoid double-reset
         self.downloading = False
         self._user_cancelled = False
+        # Cancel the pending timer if it exists
+        if self._cancel_timer_id:
+            self.root.after_cancel(self._cancel_timer_id)
+            self._cancel_timer_id = None
         self.download_btn.configure(state="normal", bg="#e94560")
         self.cancel_btn.configure(state="disabled")
         self.progress_bar["value"] = 0
@@ -522,7 +552,8 @@ class DownloaderApp:
             self.engine.cancel()
             self._log("⛔ Download cancelled by user.")
             # Give the thread a moment to finish, then clean up
-            self.root.after(500, self._download_cancelled)
+            # Store timer ID so we can cancel it if on_error fires first
+            self._cancel_timer_id = self.root.after(500, self._download_cancelled)
 
 
 # ─── CLI Mode ────────────────────────────────────────────────────────────────
@@ -532,6 +563,7 @@ def cli_download(url, resolution=None, audio_only=False, audio_format="mp3", out
     download_dir = output_dir or DEFAULT_DOWNLOAD_DIR
 
     def on_progress(pct, downloaded, total, speed, eta):
+        pct = max(0.0, min(100.0, pct))
         bar_len = 40
         filled = int(bar_len * pct / 100)
         bar = "█" * filled + "░" * (bar_len - filled)
@@ -588,13 +620,17 @@ Examples:
 
     if args.url:
         # CLI mode — direct download
-        cli_download(
-            url=args.url,
-            resolution=args.res,
-            audio_only=args.audio,
-            audio_format=args.audio_format,
-            output_dir=args.dir,
-        )
+        try:
+            cli_download(
+                url=args.url,
+                resolution=args.res,
+                audio_only=args.audio,
+                audio_format=args.audio_format,
+                output_dir=args.dir,
+            )
+        except KeyboardInterrupt:
+            print("\n\n⛔ Download cancelled.")
+            sys.exit(0)
     else:
         # GUI mode
         root = tk.Tk()
